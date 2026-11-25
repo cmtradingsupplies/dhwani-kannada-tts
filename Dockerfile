@@ -10,6 +10,12 @@ RUN apt-get update \
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 
+COPY app ./app
+COPY lib ./lib
+COPY scripts/synthesize.py ./scripts/synthesize.py
+COPY postcss.config.mjs tsconfig.json ./
+RUN pnpm build && chown -R node:node .next
+
 COPY requirements-voice.txt ./
 RUN python3 -m venv .venv \
     && .venv/bin/python -m pip install --no-cache-dir -r requirements-voice.txt
@@ -23,12 +29,6 @@ RUN mkdir models \
       bff423259625c0c1182e5b417f68560b6a55f3c4d27557a6abf2fbe51e7e00ee "models/$model" \
       feaf88702f1f045fdf4bd23606267344afb96141291de8a8118cdef125daf302 "models/$model.json" \
       | sha256sum -c -
-
-COPY app ./app
-COPY lib ./lib
-COPY scripts/synthesize.py ./scripts/synthesize.py
-COPY postcss.config.mjs tsconfig.json ./
-RUN pnpm build && chown -R node:node .next
 
 USER node
 ENV NODE_ENV=production PORT=3000

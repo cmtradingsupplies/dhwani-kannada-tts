@@ -16,6 +16,7 @@ export default function Page() {
   const [rate, setRate] = useState(-5);
   const [pitch, setPitch] = useState(-2);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<{ completed: number; total: number } | null>(null);
   const [error, setError] = useState<ErrorCode | null>(null);
   const [audioUrl, setAudioUrl] = useState("");
   const [fallback, setFallback] = useState(false);
@@ -86,21 +87,39 @@ export default function Page() {
       textarea.current?.focus();
       return;
     }
-    setAudioUrl("");
+    audio.current?.pause();
     setPlayHint(false);
+    setProgress(null);
     setBusy(true);
     try {
-      const response = await fetch("/api/tts", {
+      let response = await fetch("/api/tts", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", Prefer: "respond-async" },
         body: JSON.stringify({ text, rate: signed(rate, "%"), pitch: signed(pitch, "st") }),
-        signal: AbortSignal.timeout(95_000),
+        signal: AbortSignal.timeout(90_000),
       });
+      const deadline = Date.now() + 13 * 60_000;
+      while (response.status === 202 && Date.now() < deadline) {
+        const status = await response.json();
+        if (typeof status.jobId !== "string") throw new Error("Invalid job");
+        setProgress({ completed: status.completed, total: status.total });
+        const url = `/api/tts?job=${encodeURIComponent(status.jobId)}`;
+        // A brief connection loss does not cancel synthesis on the server.
+        for (let attempt = 0; attempt < 4; attempt++) {
+          await new Promise((resolve) => setTimeout(resolve, attempt ? 5_000 : 2_000));
+          try {
+            response = await fetch(url, { cache: "no-store", signal: AbortSignal.timeout(15_000) });
+            if (![503, 504].includes(response.status)) break;
+          } catch (error) {
+            if (attempt === 3) throw error;
+          }
+        }
+      }
       if (!response.ok) {
         const result = await response.json().catch(() => null);
         const code = result?.code;
         setError(typeof code === "string" && Object.hasOwn(messages, code) ? code as ErrorCode : "unavailable");
-        setFallback(response.status === 429 || response.status >= 500);
+        setFallback(response.status === 404 || response.status === 429 || response.status >= 500);
         return;
       }
       const mp3 = await response.blob();
@@ -111,6 +130,7 @@ export default function Page() {
       setFallback(true);
     } finally {
       setBusy(false);
+      setProgress(null);
     }
   }
 
@@ -175,17 +195,20 @@ export default function Page() {
           </div>
         </section>
 
-        <form className="studio" onSubmit={speak} aria-busy={busy}>
+        <form className="studio" onSubmit={speak}>
           <section className="editor">
             <div className="section-title flex flex-wrap items-center justify-between gap-3">
               <label htmlFor="kannada-text">Your text</label>
               <button type="button" className="sample" disabled={busy} onClick={() => { updateText(example); textarea.current?.focus(); }}>Use sample text</button>
             </div>
-            <textarea id="kannada-text" ref={textarea} lang="kn" value={text} maxLength={MAX_LENGTH}
+            <textarea id="kannada-text" ref={textarea} lang="kn" value={text}
               onChange={(event) => updateText(event.target.value)} readOnly={busy}
               aria-describedby="text-count" aria-invalid={error === "empty" || error === "kannada" || error === "tooLong"}
               placeholder="ನೀವು ಕೇಳಲು ಬಯಸುವ ಕನ್ನಡ ಪಠ್ಯವನ್ನು ಇಲ್ಲಿ ಬರೆಯಿರಿ…" />
-            <div className="counter" id="text-count">{text.length.toLocaleString("en-IN")} / 2,000</div>
+            <div className={text.length > MAX_LENGTH ? "counter over-limit" : "counter"} id="text-count">
+              {text.length.toLocaleString("en-IN")} / {MAX_LENGTH.toLocaleString("en-IN")}
+              {text.length > MAX_LENGTH && " · Over the limit"}
+            </div>
           </section>
 
           <div className="settings">
@@ -220,6 +243,19 @@ export default function Page() {
             <button type="submit" className="speak" disabled={busy}>
               {busy ? "Generating audio…" : <><span aria-hidden="true" className="play-symbol"/><span lang="kn">ಮಾತನಾಡಿಸಿ</span><span className="speak-divider">/</span> Speak</>}
             </button>
+            {busy && (
+              <div className="generation-status" role="status">
+                {progress ? (
+                  <>
+                    <progress value={progress.completed} max={progress.total} aria-label="Audio generation progress" />
+                    <p>{progress.completed === progress.total
+                      ? "Preparing your MP3…"
+                      : `Converting text · ${progress.completed} of ${progress.total} parts complete`}</p>
+                  </>
+                ) : <p>Connecting to the speech server…</p>}
+                <p>Keep this tab open. Long passages can take several minutes.</p>
+              </div>
+            )}
             {error && <p role="alert" className="error"><span lang="kn">{messages[error][0]}</span><span>{messages[error][1]}</span></p>}
             {fallback && canSpeak && (
               <button type="button" className="sample fallback" onClick={speakOnDevice}>
@@ -231,7 +267,7 @@ export default function Page() {
           {audioUrl && (
             <section className="result" aria-labelledby="result-title">
               <div className="section-title flex flex-wrap items-center justify-between gap-2">
-                <h2 id="result-title">Your audio</h2>
+                <h2 id="result-title">{busy || error ? "Previous audio" : "Your audio"}</h2>
                 <a className="sample" href={audioUrl} download="dhwani.mp3">Download MP3</a>
               </div>
               <audio ref={audio} src={audioUrl} controls preload="metadata" aria-label="Generated Kannada audio" onPlay={() => setPlayHint(false)} onError={() => setError("playback")}/>

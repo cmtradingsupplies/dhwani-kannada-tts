@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { isIP } from "node:net";
 import { join } from "node:path";
@@ -8,13 +8,13 @@ import { messages, validateText, type ErrorCode } from "../../../lib/tts";
 import { splitText } from "../../../lib/speech-server";
 
 export const runtime = "nodejs";
-export const maxDuration = 90;
-
 const WINDOW_MS = 60_000;
 const CACHE_TTL = 60 * 60_000;
 const MAX_BODY = 16_384;
-const MAX_AUDIO = 4 * 1024 * 1024;
+const MAX_AUDIO = 8 * 1024 * 1024;
 const CACHE_BUDGET = 24 * 1024 * 1024;
+const JOB_TTL = 15 * 60_000;
+const MAX_SYNTHESIS_MS = 12 * 60_000;
 const python = process.platform === "win32"
   ? join(process.cwd(), ".venv", "Scripts", "python.exe")
   : join(process.cwd(), ".venv", "bin", "python");
@@ -22,7 +22,17 @@ const model = join(process.cwd(), "models", "kn_IN-syspin_male-medium.onnx");
 const synthesizer = join(process.cwd(), "scripts", "synthesize.py");
 const limits = new Map<string, { count: number; expires: number }>();
 const cache = new Map<string, { bytes: Buffer; expires: number }>();
-const pending = new Map<string, Promise<Buffer>>();
+type SpeechJob = {
+  token: string;
+  total: number;
+  completed: number;
+  expires: number;
+  failed: boolean;
+  audio?: Buffer;
+  result: Promise<Buffer>;
+};
+const active = new Map<string, SpeechJob>();
+const jobs = new Map<string, SpeechJob>();
 let cacheSize = 0;
 let nextSweep = 0;
 
@@ -82,20 +92,29 @@ async function readBytes(body: ReadableStream<Uint8Array> | null, maxBytes: numb
   return Buffer.concat(parts, length);
 }
 
-function synthesize(text: string, rate: number, pitch: number) {
+function synthesize(chunks: string[], rate: number, pitch: number, onProgress: (completed: number) => void) {
   return new Promise<Buffer>((resolve, reject) => {
     const child = execFile(python, [synthesizer], {
       encoding: "buffer",
       maxBuffer: MAX_AUDIO,
-      timeout: 85_000,
+      timeout: MAX_SYNTHESIS_MS,
       windowsHide: true,
     }, (error, audio) => {
       if (error) return reject(error);
       if (audio.length < 4) return reject(new Error("Empty MP3 response"));
       resolve(audio);
     });
-    child.stdin?.on("error", reject);
-    child.stdin?.end(JSON.stringify({ chunks: splitText(text), rate, pitch }));
+    let remainder = "";
+    child.stderr?.setEncoding("utf8").on("data", (data: string) => {
+      const lines = (remainder + data).split("\n");
+      remainder = lines.pop() ?? "";
+      for (const line of lines) {
+        const match = /^progress:(\d+)\s*$/.exec(line);
+        if (match) onProgress(Number(match[1]));
+      }
+    });
+    child.stdin?.on("error", () => { /* execFile reports failures after the process exits. */ });
+    child.stdin?.end(JSON.stringify({ chunks, rate, pitch }));
   });
 }
 
@@ -119,6 +138,22 @@ function audioResponse(bytes: Buffer) {
       "Cache-Control": "no-store",
     },
   });
+}
+
+function jobStatus(job: SpeechJob) {
+  return NextResponse.json(
+    { jobId: job.token, completed: job.completed, total: job.total },
+    { status: 202, headers: { "Cache-Control": "no-store" } },
+  );
+}
+
+export function GET(req: Request) {
+  const token = new URL(req.url).searchParams.get("job");
+  const job = token && jobs.get(token);
+  if (!job || job.expires <= Date.now()) return fail("expired", 404, { "Cache-Control": "no-store" });
+  if (job.failed) return fail("unavailable", 502, { "Cache-Control": "no-store" });
+  if (job.audio) return audioResponse(job.audio);
+  return jobStatus(job);
 }
 
 export async function POST(req: Request) {
@@ -159,21 +194,41 @@ export async function POST(req: Request) {
     return fail("setup", 503);
   }
 
-  try {
-    let job = pending.get(id);
-    if (!job) {
-      if (pending.size >= 2) return fail("busy", 429, retryAfter(5));
-      job = synthesize(text, speed, semitones)
+  let job = active.get(id);
+  if (!job) {
+    if (active.size >= 1) return fail("busy", 429, retryAfter(10));
+    for (const [token, recent] of jobs) {
+      if (recent.expires <= now || (jobs.size >= 8 && (recent.audio || recent.failed))) jobs.delete(token);
+    }
+    const chunks = splitText(text);
+    const created: SpeechJob = {
+      token: randomUUID(), total: chunks.length, completed: 0, expires: now + JOB_TTL, failed: false,
+      result: synthesize(chunks, speed, semitones, (completed) => { created.completed = completed; })
         .then((bytes) => {
           saveAudio(id, bytes);
+          created.audio = bytes;
           return bytes;
         })
-        .finally(() => pending.delete(id));
-      pending.set(id, job);
-    }
-    return audioResponse(await job);
+        .catch((error) => {
+          created.failed = true;
+          console.warn("Speech synthesis failed", error instanceof Error ? error.name : "UnknownError");
+          throw error;
+        })
+        .finally(() => {
+          created.expires = Date.now() + 2 * 60_000;
+          active.delete(id);
+        }),
+    };
+    // Async clients learn about failure via GET.
+    void created.result.catch(() => {});
+    jobs.set(created.token, created);
+    active.set(id, created);
+    job = created;
+  }
+  if (req.headers.get("prefer") === "respond-async" || text.length > 350) return jobStatus(job);
+  try {
+    return audioResponse(await job.result);
   } catch (error) {
-    console.warn("Speech synthesis failed", error instanceof Error ? error.name : "UnknownError");
     return fail("unavailable", 502);
   }
 }

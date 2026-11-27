@@ -1,6 +1,6 @@
 import { LOCALE } from "./tts";
 
-const CHUNK_SIZE = 350;
+const CHUNK_SIZE = 200;
 const sentenceEnd = /[.!?।॥]+["'”’»)]*(?=\s|$)/gu;
 
 export function splitText(text: string): string[] {

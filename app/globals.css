@@ -93,6 +93,9 @@ textarea {
 }
 textarea::placeholder { color: var(--muted); opacity: 1; }
 .counter { text-align: right; font-size: .875rem; color: var(--muted); margin-top: 8px; font-variant-numeric: tabular-nums; }
+.counter.over-limit { color: var(--danger); font-weight: 650; }
+.generation-status { margin-top: 12px; color: var(--muted); font-size: .875rem; }
+.generation-status progress { width: 100%; accent-color: var(--accent); }
 .settings { border-top: 1px solid var(--line); padding-top: 14px; }
 .voice-tag { font-size: .875rem; color: var(--accent); font-weight: 650; white-space: nowrap; }
 fieldset { min-width: 0; }
